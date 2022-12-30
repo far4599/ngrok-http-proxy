@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"io/ioutil"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 
 	"golang.org/x/sync/errgroup"
-	"gopkg.in/yaml.v3"
 )
+
+const proxyPort = 8000
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -17,12 +20,7 @@ func main() {
 
 	token := os.Getenv("NGROK_AUTHTOKEN")
 	if len(token) == 0 {
-		log.Fatalln("Please provide ngrok auth token via $NGROK_AUTHTOKEN. \nTo get one sign up at https://dashboard.ngrok.com/signup")
-	}
-
-	err := setupNgrokToken("./config.yml", token)
-	if err != nil {
-		log.Fatalf("failed to write token to ngrok config file: '%s'", err)
+		log.Fatalln("Please provide ngrok auth token via $NGROK_AUTHTOKEN. \nTo get one visit https://dashboard.ngrok.com/get-started/your-authtoken")
 	}
 
 	errGroup, errCtx := errgroup.WithContext(ctx)
@@ -32,48 +30,51 @@ func main() {
 	})
 
 	errGroup.Go(func() error {
-		return startNgrok(ctx)
+		return startNgrok(ctx, token)
 	})
 
-	err = errGroup.Wait()
-	if err != nil {
+	if err := errGroup.Wait(); err != nil {
 		log.Fatalf("exit with error: %s", err)
 	}
 }
 
 func startGOST(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "./gost", "-L=:8000")
+	cmd := exec.CommandContext(ctx, "gost", fmt.Sprintf("-L=:%d", proxyPort))
 
-	return cmd.Run()
+	cmd.Stdout = stdout{}
+
+	err := cmd.Run()
+	if err != nil {
+		return cmd.Err
+	}
+
+	return err
 }
 
-func startNgrok(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "./ngrok", "tcp", "8000", "--config=./config.yml")
+func startNgrok(ctx context.Context, token string) error {
+	cmd := exec.CommandContext(ctx, "ngrok", "tcp", fmt.Sprint(proxyPort), "--log", "stdout", "--authtoken", token)
 
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stdout
+	cmd.Stdout = stdout{}
 
-	return cmd.Run()
+	err := cmd.Run()
+	if err != nil {
+		return cmd.Err
+	}
+
+	return err
 }
 
-func setupNgrokToken(file, token string) error {
-	config := struct {
-		Version   int    `yaml:"version"`
-		Authtoken string `yaml:"authtoken"`
-	}{
-		Version:   2,
-		Authtoken: token,
+type stdout struct{}
+
+func (stdout) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("started tunnel")) {
+		url := regexp.MustCompile("url=tcp://(\\S+)").FindAllSubmatch(p, -1)
+		if len(url) > 0 {
+			fmt.Printf("HTTP proxy listens at '%s'", url[0][1])
+		}
+	} else if bytes.Contains(p, []byte("error")) {
+		fmt.Printf("Error: '%s'", p)
 	}
 
-	fileContent, err := yaml.Marshal(config)
-	if err != nil {
-		return err
-	}
-
-	err = ioutil.WriteFile(file, fileContent, 0600)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return len(p), nil
 }
